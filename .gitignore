@@ -1,0 +1,10 @@
+# Runtime state written next to the scripts when the repo is cloned into ~/.claude/iterm-restore
+layout.json
+layout.json.*.tmp
+restore.log
+hook-errors.log
+hooks/
+backups/
+__pycache__/
+*.pyc
+.DS_Store
