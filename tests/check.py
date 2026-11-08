@@ -15,6 +15,9 @@ import tempfile
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 failures = []
+# the checks must not depend on which Claude account started them, nor on the user's own accounts file
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
+os.environ["ITERM_RESTORE_ACCOUNTS"] = os.path.join(tempfile.mkdtemp(), "no-accounts.json")
 
 
 def check(name, ok, detail=""):
@@ -36,6 +39,13 @@ with tempfile.TemporaryDirectory() as home:
     out_dir = os.path.join(home, ".claude", "iterm-restore", "hooks")
     check("hook exits 0 and prints nothing", r.returncode == 0 and r.stdout == "" and r.stderr == "", r.stdout + r.stderr)
     check("hook wrote the tab record", os.path.exists(os.path.join(out_dir, "ABC-123.json")))
+    check("hook records no config folder when CLAUDE_CONFIG_DIR is unset", "config_dir" not in json.load(open(os.path.join(out_dir, "ABC-123.json"))))
+    alt = os.path.join(home, "alt-config")
+    os.makedirs(alt)
+    os.symlink(alt, os.path.join(home, "alt-link"))
+    subprocess.run([sys.executable, os.path.join(BASE, "hook.py")], input=json.dumps({"session_id": "s1", "cwd": "/x"}), capture_output=True, text=True,
+                   env=dict(env, CLAUDE_CONFIG_DIR=os.path.join(home, "alt-link")))
+    check("hook records the real config folder when CLAUDE_CONFIG_DIR is set", json.load(open(os.path.join(out_dir, "ABC-123.json"))).get("config_dir") == os.path.realpath(alt))
     for bad in ("w0t0p0:../../escape", "w0t0p0:a/b", "w0t0p0:..", "nocolon", ""):
         env2 = dict(env, ITERM_SESSION_ID=bad)
         r = subprocess.run([sys.executable, os.path.join(BASE, "hook.py")], input=json.dumps({"session_id": "s2"}), capture_output=True, text=True, env=env2)
@@ -231,6 +241,8 @@ with tempfile.TemporaryDirectory() as state:
     check("a changing title or job does not change the signature", sig(a) == sig(b))
     check("a different folder changes the signature", sig(a) != sig(c))
     check("a different conversation changes the signature", sig(a) != sig(d))
+    e = {"windows": [{"tabs": [{"root": pane(iterm_id="A", cwd="/a", name="x", job="zsh", claude={"sessionId": uid, "config_dir": "/other"})}]}]}
+    check("learning a tab's account changes the signature, so it gets saved", sig(a) != sig(e))
 
     # a rejected C1 control character
     check("C1 control characters are refused in folders", ns["resume_command"]({"cwd": "/tmp/a\u0085b", "claude": {"sessionId": uid}}) == "")
@@ -465,6 +477,131 @@ with tempfile.TemporaryDirectory() as state:
         check("and stays quiet about that when they can", "no conversation files can be found" not in doctor_out([entry]))
     finally:
         child2.kill()
+
+    # several Claude accounts: each tab resumes on the config folder it ran on (accounts.json, see the README)
+    ans = {"__name__": "qa_accounts"}
+    exec(compile(head, "restore_head", "exec"), ans)
+    ans["notify"] = lambda m: None
+    work_dir = os.path.join(state, "acct-work")
+    pers_real = os.path.join(state, "acct-personal-real")
+    pers_link = os.path.join(state, "acct-personal")
+    for d in (work_dir, pers_real):
+        os.makedirs(os.path.join(d, "sessions"))
+        os.makedirs(os.path.join(d, "projects", "-f"))
+    os.symlink(pers_real, pers_link)
+    pr = os.path.realpath(pers_real)
+    ans["SESSIONS"] = os.path.join(work_dir, "sessions")
+    ans["CLAUDE_PROJECTS"] = os.path.join(work_dir, "projects")
+    acc_file = os.path.join(state, "accounts.json")
+    ans["ACCOUNTS_FILE"] = acc_file
+    write_accounts = lambda obj: open(acc_file, "w").write(obj if isinstance(obj, str) else json.dumps(obj))
+    personal = {"config_dir": pers_link, "command": "claude-personal"}
+    pid_uid = "pers-jjjjjjjj"
+
+    check("no accounts file: only the default account", [a["command"] for a in ans["accounts"]()] == ["claude"])
+    check("no accounts file: a recorded personal folder is ignored and claude resumes as before",
+          shlex.split(ans["resume_command"]({"cwd": "/tmp", "claude": {"sessionId": uid, "config_dir": pr}})) == ["cd", "/tmp", "&&", "claude", "--resume", uid])
+    write_accounts({"accounts": [personal]})
+    check("an accounts entry loads", [a["command"] for a in ans["accounts"]()] == ["claude", "claude-personal"])
+    check("a symlinked config folder matches its target", ans["account_for"](pers_real)["command"] == "claude-personal" and ans["account_for"](pers_link)["command"] == "claude-personal")
+    cmd_p = ans["resume_command"]({"cwd": "/tmp", "claude": {"sessionId": uid, "config_dir": pr}})
+    check("a personal pane resumes with its own command, as safe tokens", shlex.split(cmd_p) == ["cd", "/tmp", "&&", "claude-personal", "--resume", uid], cmd_p)
+    check("a pane with no config folder resumes with claude", "&& claude --resume" in ans["resume_command"]({"cwd": "/tmp", "claude": {"sessionId": uid}}))
+    check("a pane on the default folder resumes with claude", "&& claude --resume" in ans["resume_command"]({"cwd": "/tmp", "claude": {"sessionId": uid, "config_dir": work_dir}}))
+    for odd in ("/somewhere/else", 123, "relative/path", "/tmp/a\x1bb", ["x"], ""):
+        check("an unknown or malformed config folder %r restores the folder only" % (odd,), ans["resume_plan"]({"cwd": "/tmp", "claude": {"sessionId": uid, "config_dir": odd}}) == ("cd /tmp", "cd"))
+    for bad in ("claude; rm -rf ~", "-x", "a b", "claude\n", "", 7, None, "/usr/local/bin/claude", "$(id)", "x" * 65):
+        write_accounts({"accounts": [{"config_dir": pers_link, "command": bad}]})
+        check("an unsafe command %r is never loaded" % (bad,)[:60], len(ans["accounts"]()) == 1)
+    for garbage in ("{not json", "[]", '{"accounts": "x"}', '{"accounts": [1, null]}', '{"accounts": [{"command": "claude-personal"}]}'):
+        write_accounts(garbage)
+        check("a malformed accounts file %r is ignored" % garbage, len(ans["accounts"]()) == 1)
+    check("a bad accounts file is logged", "accounts file" in open(log).read())
+    write_accounts({"accounts": [{"config_dir": work_dir, "command": "claude-dup"}, personal, {"config_dir": pers_real, "command": "claude-other"}]})
+    check("entries for the default folder or a folder already listed are skipped, the first one wins", [a["command"] for a in ans["accounts"]()] == ["claude", "claude-personal"])
+    write_accounts({"accounts": [personal]})
+
+    # live sessions, the double-typing guard and the tab lookup cover every account
+    child3 = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        json.dump({"pid": os.getpid(), "sessionId": "work-kkkkkkkk", "kind": "interactive", "cwd": "/w"}, open(os.path.join(work_dir, "sessions", "%d.json" % os.getpid()), "w"))
+        json.dump({"pid": child3.pid, "sessionId": pid_uid, "kind": "interactive", "cwd": "/p"}, open(os.path.join(pers_real, "sessions", "%d.json" % child3.pid), "w"))
+        _t.sleep(0.3)
+        found = {s["sessionId"]: s for s in ans["live_claude_sessions"]()}
+        check("live sessions are found in every account", "work-kkkkkkkk" in found and pid_uid in found, str(sorted(found)))
+        check("a live session on an extra account carries its folder, a default one does not",
+              found.get(pid_uid, {}).get("config_dir") == pr and "config_dir" not in found.get("work-kkkkkkkk", {"config_dir": 1}))
+        check("the double-typing guard sees every account", {"work-kkkkkkkk", pid_uid} <= ans["live_session_ids"]())
+    finally:
+        child3.kill()
+    real_live_a = ans["live_claude_sessions"]
+    ans["live_claude_sessions"] = lambda: [{"sessionId": pid_uid, "cwd": "/p", "kind": "interactive", "tty": "/dev/ttysP", "started": 100, "config_dir": pr}]
+    check("the tab lookup keeps the account", ans["claude_by_tty"]()["/dev/ttysP"].get("config_dir") == pr)
+    ans["live_claude_sessions"] = real_live_a
+
+    # conversation files are looked up in the tab's own account
+    for folder, sid in ((pers_real, pid_uid), (work_dir, "work-kkkkkkkk"), (work_dir, "both-llllllll"), (pers_real, "both-llllllll")):
+        open(os.path.join(folder, "projects", "-f", sid + ".jsonl"), "w").write("{}\n")
+    check("a personal conversation is found in its own account", not ans["known_missing"](pid_uid, pr))
+    check("and not in the default account", ans["known_missing"](pid_uid))
+    check("a work conversation is not found in the personal account", ans["known_missing"]("work-kkkkkkkk", pr) and not ans["known_missing"]("work-kkkkkkkk"))
+    check("the same id in both accounts resolves in each", not ans["known_missing"]("both-llllllll") and not ans["known_missing"]("both-llllllll", pr))
+    check("a folder no account lists counts as missing", ans["known_missing"](pid_uid, "/somewhere/else"))
+
+    # which account a tab is on: the live file decides, like the conversation id
+    apick = ans["pick_claude"]
+    t_now = _time.time()
+    live_p = {"sessionId": pid_uid, "cwd": "/p", "started": t_now - 1000, "config_dir": pr}
+    live_w = {"sessionId": "work-kkkkkkkk", "cwd": "/w", "started": t_now - 1000}
+    check("pick: the live file's account is kept", apick(None, live_p, "a1").get("config_dir") == pr)
+    check("pick: a hook record agreeing with a personal live file keeps the account", apick({"session_id": pid_uid, "cwd": "/p", "config_dir": pr}, live_p, "a2").get("config_dir") == pr)
+    check("pick: a hook record claiming another account loses to the live file", "config_dir" not in apick({"session_id": "work-kkkkkkkk", "cwd": "/w", "config_dir": pr}, live_w, "a3"))
+    check("pick: an old hook record with no folder takes the account from the live file", apick({"session_id": pid_uid, "cwd": "/p"}, live_p, "a3b").get("config_dir") == pr)
+    check("pick: with no live file the hook record's folder is used", apick({"session_id": pid_uid, "cwd": "/p", "config_dir": pr}, None, "a4").get("config_dir") == pr)
+    check("pick: a record without a folder means the default account", "config_dir" not in apick({"session_id": pid_uid, "cwd": "/p"}, None, "a5"))
+    check("pick: a non-string folder in a hook record is dropped", "config_dir" not in apick({"session_id": pid_uid, "cwd": "/p", "config_dir": ["x"]}, None, "a6"))
+
+    # typing into a pane, end to end
+    ans["asyncio"] = FakeAsyncio()
+    ans["DRY"] = False
+
+    async def drive_account(claude, running=()):
+        ans["live_session_ids"] = lambda: set(running)
+        s = FakeSession("zsh", "/dev/ttyA")
+        kind = await ans["run_in_pane"](s, {"name": "t", "cwd": "/tmp", "claude": dict(claude, cwd="/tmp")}, set(), {"unknown_job": 0, "shell_misnamed": 0, "cmds": {}})
+        return kind, s.typed
+
+    got = _asyncio.run(drive_account({"sessionId": pid_uid, "config_dir": pr}))
+    check("a personal tab is resumed with claude-personal", got == ("claude", ["cd /tmp && claude-personal --resume %s\r" % pid_uid]), str(got))
+    got = _asyncio.run(drive_account({"sessionId": "work-kkkkkkkk"}))
+    check("a work tab is resumed with claude", got == ("claude", ["cd /tmp && claude --resume work-kkkkkkkk\r"]), str(got))
+    got = _asyncio.run(drive_account({"sessionId": pid_uid, "config_dir": pr}, [pid_uid]))
+    check("a personal conversation already running in another tab is not typed again", got == (None, []), str(got))
+    got = _asyncio.run(drive_account({"sessionId": pid_uid, "config_dir": "/somewhere/else"}))
+    check("a tab on a folder no account lists gets its folder only", got == ("cd", ["cd /tmp\r"]), str(got))
+    check("and the log says why without repeating the folder", "does not list" in open(log).read() and "/somewhere/else" not in open(log).read())
+    ans["asyncio"] = _asyncio
+
+    # the doctor knows the extra account and reads its session files
+    def doctor_accounts():
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            ans["doctor"]()
+        return buffer.getvalue()
+
+    for f in glob.glob(os.path.join(work_dir, "sessions", "*.json")):
+        os.remove(f)
+    json.dump({"pid": 1, "sessionId": pid_uid, "kind": "interactive", "cwd": "/p", "procStart": "Fri Oct 30 16:19:47 2026"}, open(os.path.join(pers_real, "sessions", "1.json"), "w"))
+    out = doctor_accounts()
+    check("the doctor lists the extra account", "extra Claude account" in out and "claude-personal" in out, out[-400:])
+    check("the doctor reads session files from every account", "no Claude session files found" not in out)
+    write_accounts({"accounts": [{"config_dir": pers_link, "command": "bad cmd"}]})
+    out = doctor_accounts()
+    check("the doctor warns about an unusable accounts entry", "not usable" in out and "WARN" in out)
+    write_accounts({"accounts": [{"config_dir": pers_link, "command": "no-such-command-qa"}]})
+    check("the doctor warns when an account's command is not on PATH", "not on PATH" in doctor_accounts())
+    os.remove(acc_file)
+    check("the doctor says nothing about accounts when there is no file", "account" not in doctor_accounts().lower().replace("accounts file does not list", ""))
 
 # the hook only records for Claude: walk a fake process table
 hook_src = open(os.path.join(BASE, "hook.py")).read().split("\ntry:\n    main()")[0]

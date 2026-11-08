@@ -5,6 +5,8 @@ restore.log
 hook-errors.log
 hooks/
 backups/
+# your own Claude accounts, if you run several (see the README)
+accounts.json
 __pycache__/
 *.pyc
 .DS_Store

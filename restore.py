@@ -53,6 +53,7 @@ BACKUPS = os.path.join(STATE, "backups")
 LOG = os.path.join(STATE, "restore.log")
 SESSIONS = os.path.join(HOME, ".claude", "sessions")
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
+ACCOUNTS_FILE = os.environ.get("ITERM_RESTORE_ACCOUNTS") or os.path.join(DIR, "accounts.json")  # optional: extra Claude config folders (see the README)
 CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 
 SNAPSHOT_VERSION = 1
@@ -76,6 +77,7 @@ SHELLS = {"zsh", "-zsh", "bash", "-bash", "fish", "-fish", "sh", "-sh"}
 SHELL_NAMES = {s.lstrip("-") for s in SHELLS}
 STARTING_UP = {None, "", "login"}  # what a brand new pane reports for a moment before its shell takes over
 SAFE_ID = re.compile(r"[0-9A-Za-z][0-9A-Za-z_-]{7,63}")  # starts with a letter or digit, so it can never read as a flag
+SAFE_COMMAND = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")  # a bare program name from the accounts file: no spaces, slashes or shell characters
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 DRY = "--dry-run" in sys.argv
@@ -177,6 +179,77 @@ def safe_folder(value):
     return isinstance(value, str) and value.startswith("/") and not CONTROL_CHARS.search(value)
 
 
+# ---------- Claude accounts (config folders) ----------
+# Claude Code keeps everything for one account in one config folder: ~/.claude by default, or wherever CLAUDE_CONFIG_DIR
+# points. accounts.json lists any extra folders and the command that starts Claude on each, so each tab resumes on the
+# account it ran on. Without that file only the default account exists and nothing below changes how the script behaves.
+
+def real_dir(path):
+    """The canonical form of a folder path, for comparing. None for anything that is not a usable absolute path."""
+    if not isinstance(path, str) or not path or len(path) > 4096 or CONTROL_CHARS.search(path):
+        return None
+    path = os.path.expanduser(path)
+    return os.path.realpath(path) if path.startswith("/") else None
+
+
+def recorded_dir(value):
+    """A config folder read from a hook record or a saved layout, kept only if it looks like a path. Those files can be
+    written by anything, so the folder only ever selects a command by matching an account, at restore time."""
+    return value if real_dir(value) else None
+
+
+def default_account():
+    """The account in ~/.claude. Built from SESSIONS at call time, so the tests can point it somewhere else."""
+    return {"config_dir": real_dir(os.path.dirname(SESSIONS)), "sessions": SESSIONS, "projects": CLAUDE_PROJECTS, "command": "claude", "default": True}
+
+
+def read_accounts_file():
+    """(extra accounts, problems) from ACCOUNTS_FILE. No file gives ([], []). An entry needs a config_dir path and a
+    command that is a bare program name, because that command gets typed into a terminal. An entry for the default
+    folder, or for a folder already listed, is skipped: the first one wins."""
+    try:
+        with open(ACCOUNTS_FILE) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return [], []
+    except Exception as e:
+        return [], ["the accounts file %s cannot be read (%s)" % (ACCOUNTS_FILE, e.__class__.__name__)]
+    entries = data.get("accounts") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return [], ["the accounts file %s needs the shape {\"accounts\": [{\"config_dir\": ..., \"command\": ...}]}" % ACCOUNTS_FILE]
+    seen, found, problems = {default_account()["config_dir"]}, [], []
+    for number, entry in enumerate(entries, 1):
+        command = entry.get("command") if isinstance(entry, dict) else None
+        folder = real_dir(entry.get("config_dir")) if isinstance(entry, dict) else None
+        if not folder or not isinstance(command, str) or not SAFE_COMMAND.fullmatch(command):
+            problems.append("entry %d in the accounts file is not usable: it needs a config_dir path and a plain command name such as claude-work" % number)
+            continue
+        if folder in seen:
+            continue
+        seen.add(folder)
+        found.append({"config_dir": folder, "sessions": os.path.join(folder, "sessions"), "projects": os.path.join(folder, "projects"),
+                      "command": command, "default": False})
+    return found, problems
+
+
+def accounts():
+    """The default account first, then the valid extra ones. Problems with the file are logged once per version of it."""
+    extra, problems = read_accounts_file()
+    for problem in problems:
+        complain_once(("accounts", mtime(ACCOUNTS_FILE), problem), problem + ", so it is ignored")
+    return [default_account()] + extra
+
+
+def account_for(config_dir, known=None):
+    """The account a recorded config folder belongs to. No folder means the default account. With no extra accounts the
+    folder is ignored, exactly as before accounts existed. A folder that matches no account gives None."""
+    known = known if known is not None else accounts()
+    if config_dir is None or len(known) == 1:
+        return known[0]
+    folder = real_dir(config_dir)
+    return next((a for a in known if folder and a["config_dir"] == folder), None)
+
+
 # ---------- reading the machine ----------
 
 def ps_rows(column):
@@ -227,10 +300,11 @@ def start_matches(recorded, from_ps):
 
 
 def live_claude_sessions():
-    """Every live Claude process known to Claude Code's own session files: [{pid, sessionId, cwd, kind, tty, started}].
-    Claude names each file after its process id, so we open <pid>.json for each running process. The cost follows the
-    number of processes, never the number of old session files. If Claude Code ever stops naming files that way,
-    nothing is found here, and the hook (and --doctor) carry on."""
+    """Every live Claude process known to Claude Code's own session files: [{pid, sessionId, cwd, kind, tty, started}],
+    plus config_dir for a Claude on an extra account. Claude names each file after its process id, so we open
+    <pid>.json in each account's sessions folder for each running process. The cost follows the number of processes,
+    never the number of old session files. If Claude Code ever stops naming files that way, nothing is found here,
+    and the hook (and --doctor) carry on."""
     pid_info = {}
     out = ps_output(["-axo", "pid=,tty=,lstart="])
     for line in out.splitlines():
@@ -238,25 +312,29 @@ def live_claude_sessions():
         if len(parts) == 3:
             pid_info[parts[0]] = (parts[1], parts[2])
     found = []
-    for pid, info in pid_info.items():
-        path = os.path.join(SESSIONS, pid + ".json")
-        try:
-            with open(path) as f:
-                d = json.load(f)
-        except Exception:
-            continue
-        if not d.get("sessionId"):
-            continue
-        if d.get("procStart") is not None and parse_ps_time(d["procStart"]) is None:
-            alarm(("procstart-format",), "Claude Code changed how it writes procStart (%r), so a reused process id can no longer be told apart from a live Claude" % (str(d["procStart"])[:40],))
-        if parse_ps_time(info[1]) is None:
-            alarm(("lstart-format",), "ps printed a start time this script cannot read (%r), so the process start check is off" % (info[1][:40],))
-        if not start_matches(d.get("procStart"), info[1]):
-            continue
-        started = d.get("startedAt")
-        found.append({"pid": int(pid), "sessionId": d["sessionId"], "cwd": d.get("cwd"), "kind": d.get("kind"),
-                      "tty": None if info[0] == "??" else "/dev/" + info[0],
-                      "started": started / 1000 if isinstance(started, (int, float)) else None})
+    for account in accounts():
+        for pid, info in pid_info.items():
+            path = os.path.join(account["sessions"], pid + ".json")
+            try:
+                with open(path) as f:
+                    d = json.load(f)
+            except Exception:
+                continue
+            if not d.get("sessionId"):
+                continue
+            if d.get("procStart") is not None and parse_ps_time(d["procStart"]) is None:
+                alarm(("procstart-format",), "Claude Code changed how it writes procStart (%r), so a reused process id can no longer be told apart from a live Claude" % (str(d["procStart"])[:40],))
+            if parse_ps_time(info[1]) is None:
+                alarm(("lstart-format",), "ps printed a start time this script cannot read (%r), so the process start check is off" % (info[1][:40],))
+            if not start_matches(d.get("procStart"), info[1]):
+                continue
+            started = d.get("startedAt")
+            entry = {"pid": int(pid), "sessionId": d["sessionId"], "cwd": d.get("cwd"), "kind": d.get("kind"),
+                     "tty": None if info[0] == "??" else "/dev/" + info[0],
+                     "started": started / 1000 if isinstance(started, (int, float)) else None}
+            if not account["default"]:
+                entry["config_dir"] = account["config_dir"]
+            found.append(entry)
     return found
 
 
@@ -268,30 +346,38 @@ def claude_by_tty():
     """Map terminal (e.g. /dev/ttys003) to the live interactive Claude session on it. If two share a terminal, the
     one that started last wins."""
     sessions = sorted((s for s in live_claude_sessions() if s["kind"] == "interactive" and s["tty"]), key=lambda s: s["started"] or 0)
-    return {s["tty"]: {"sessionId": s["sessionId"], "cwd": s["cwd"], "started": s["started"]} for s in sessions}
+    found = {}
+    for s in sessions:
+        found[s["tty"]] = {"sessionId": s["sessionId"], "cwd": s["cwd"], "started": s["started"]}
+        if s.get("config_dir"):
+            found[s["tty"]]["config_dir"] = s["config_dir"]
+    return found
 
 
-def transcript_exists(session_id):
-    """Does Claude have a conversation file for this id? (~/.claude/projects/<folder>/<id>.jsonl)"""
-    return safe_id(session_id) and bool(glob.glob(os.path.join(CLAUDE_PROJECTS, "*", session_id + ".jsonl")))
+def transcript_exists(session_id, config_dir=None):
+    """Does Claude have a conversation file for this id in that account? (<config folder>/projects/<folder>/<id>.jsonl)
+    An account we do not know has none."""
+    account = account_for(config_dir)
+    return bool(account) and safe_id(session_id) and bool(glob.glob(os.path.join(account["projects"], "*", session_id + ".jsonl")))
 
 
 def transcripts_findable():
-    """Can we find any Claude conversation file at all? If not (Claude moved them), a missing file means nothing.
-    Stops at the first one found and looks at no more than 200 project folders."""
-    for folder in list_dir_sorted(CLAUDE_PROJECTS)[:200]:
-        try:
-            with os.scandir(os.path.join(CLAUDE_PROJECTS, folder)) as entries:
-                if any(e.name.endswith(".jsonl") for e in entries):
-                    return True
-        except OSError:
-            continue
+    """Can we find any Claude conversation file at all, in any account? If not (Claude moved them), a missing file
+    means nothing. Stops at the first one found and looks at no more than 200 project folders per account."""
+    for account in accounts():
+        for folder in list_dir_sorted(account["projects"])[:200]:
+            try:
+                with os.scandir(os.path.join(account["projects"], folder)) as entries:
+                    if any(e.name.endswith(".jsonl") for e in entries):
+                        return True
+            except OSError:
+                continue
     return False
 
 
-def known_missing(session_id):
-    """True only when Claude's conversation files are findable and there is none for this id."""
-    return transcripts_findable() and not transcript_exists(session_id)
+def known_missing(session_id, config_dir=None):
+    """True only when Claude's conversation files are findable and that account has none for this id."""
+    return transcripts_findable() and not transcript_exists(session_id, config_dir)
 
 
 def tab_of_pid(pid):
@@ -421,20 +507,27 @@ def pick_claude(rec, fallback, tab_id):
     The live file is the authority for a running tab: the hook record is keyed by the tab, so any other program or
     second Claude run in the same tab (Grok, Codex, a headless `claude -p`) could have written it. Same id: use the
     hook record, it also has the folder. Different ids: use the live file and raise an alarm, unless that Claude is so
-    young that its own hook has not fired yet. No live file: the hook record is all there is."""
+    young that its own hook has not fired yet. No live file: the hook record is all there is.
+    The account (config_dir, absent for the default) follows the same rule: the live file's when there is one."""
     if not fallback:
         if not rec:
             return None
-        return {"sessionId": rec["session_id"], "cwd": rec.get("cwd"), "via": "hook"}
+        picked = {"sessionId": rec["session_id"], "cwd": rec.get("cwd"), "via": "hook"}
+        if recorded_dir(rec.get("config_dir")):
+            picked["config_dir"] = rec["config_dir"]
+        return picked
     if not rec:
         return dict(fallback, via="files")
     if fallback["sessionId"] == rec["session_id"]:
-        return {"sessionId": rec["session_id"], "cwd": rec.get("cwd") or fallback.get("cwd"), "via": "hook"}
+        picked = {"sessionId": rec["session_id"], "cwd": rec.get("cwd") or fallback.get("cwd"), "via": "hook"}
+        if fallback.get("config_dir"):
+            picked["config_dir"] = fallback["config_dir"]
+        return picked
     started = fallback.get("started")
     key = ("hook-disagrees", tab_id, rec["session_id"])
     if key not in _complained and not (started and time.time() - started <= STALE_HOOK_GRACE):
         reason = ("names a conversation Claude has no file for (another program such as Grok or Codex may have written it)"
-                  if known_missing(rec["session_id"]) else
+                  if known_missing(rec["session_id"], recorded_dir(rec.get("config_dir"))) else
                   "differs from the Claude running in that tab (a second Claude run in the same tab may have written it)")
         alarm(key, "a tab's hook record %s. Using the id from Claude's own session file" % reason)
     return dict(fallback, via="files (hook record disagrees)")
@@ -574,11 +667,12 @@ def read_snapshot():
 
 
 def stable_signature(layout):
-    """What identifies a layout for the save rules: its shape, the folder of each pane and which conversation is in
-    which tab. Titles and foreground jobs change all the time and are left out."""
+    """What identifies a layout for the save rules: its shape, the folder of each pane, which conversation is in which
+    tab and which account it runs on. Titles and foreground jobs change all the time and are left out."""
     return json.dumps([layout_shape(layout), sorted(
         (p.get("iterm_id") or "", p.get("cwd") or "",
-         (p.get("claude") or {}).get("sessionId") or (p.get("codex") or {}).get("sessionId") or "")
+         (p.get("claude") or {}).get("sessionId") or (p.get("codex") or {}).get("sessionId") or "",
+         str((p.get("claude") or {}).get("config_dir") or ""))
         for p in all_panes(layout))], sort_keys=True)
 
 
@@ -690,8 +784,9 @@ def resume_plan(pane):
         parts.append("cd " + shlex.quote(cwd))
         kind = "cd"
     if claude:
-        if safe_id(claude.get("sessionId")):
-            parts.append("claude --resume " + shlex.quote(claude["sessionId"]))
+        account = account_for(claude.get("config_dir"))  # None for a config folder no account lists: never guess a command
+        if account and safe_id(claude.get("sessionId")):
+            parts.append(account["command"] + " --resume " + shlex.quote(claude["sessionId"]))
             kind = "claude"
     elif safe_id((pane.get("codex") or {}).get("sessionId")):
         parts.append("codex resume " + shlex.quote(pane["codex"]["sessionId"]))
@@ -726,7 +821,8 @@ async def run_in_pane(session, pane, typed, stats=None):
         log("skip %s: %s" % (pane.get("name"), "already running %s" % job if job else "could not tell what it is running"))
         return None
     claude_id = (pane.get("claude") or {}).get("sessionId")
-    if kind == "claude" and known_missing(claude_id):
+    config_dir = (pane.get("claude") or {}).get("config_dir")
+    if kind == "claude" and known_missing(claude_id, config_dir):
         # No conversation file: a Claude tab that has had no messages yet, or an id that is not Claude's. Resuming would
         # fail either way, so restore the folder only. Foreign ids were already alarmed about when the tab was recorded.
         log("note %s: Claude has no conversation file for id %s (a tab with no messages has none), so only the folder is restored" % (pane.get("name"), claude_id[:8]))
@@ -735,8 +831,11 @@ async def run_in_pane(session, pane, typed, stats=None):
         if not cmd:
             log("skip %s: nothing safe to type" % pane.get("name"))
             return None
-    if pane.get("claude") and kind != "claude" and claude_id:  # only an id that failed the safe_id check gets here
-        log("note %s: the saved Claude session id looks unusual, so only the folder is restored" % pane.get("name"))
+    if pane.get("claude") and kind != "claude" and claude_id:  # an id that failed the safe_id check, or an unknown account
+        if safe_id(claude_id) and account_for(config_dir) is None:
+            log("note %s: that Claude ran on a config folder the accounts file does not list, so only the folder is restored" % pane.get("name"))
+        else:
+            log("note %s: the saved Claude session id looks unusual, so only the folder is restored" % pane.get("name"))
     if kind == "claude" and (claude_id in typed or claude_id in live_session_ids()):
         log("skip %s: that conversation is already running in another terminal" % pane.get("name"))
         return None
@@ -889,6 +988,15 @@ def doctor():
     say("OK" if registered else "WARN", "the SessionStart hook is registered in ~/.claude/settings.json" if registered
         else "the SessionStart hook is not registered in ~/.claude/settings.json or settings.local.json (see step 5 of the guide)")
 
+    extra, problems = read_accounts_file()  # silent when there is no accounts file
+    for problem in problems:
+        say("WARN", problem)
+    for account in extra:
+        on_path = shutil.which(account["command"])
+        say("OK" if on_path else "WARN", "extra Claude account %s resumes with %s%s" % (account["config_dir"], account["command"],
+            "" if on_path else ", but that command is not on PATH here, so typing it would fail"))
+    known = accounts()
+
     records = glob.glob(os.path.join(HOOKS, "*.json"))
     newest_record = max([mtime(p) for p in records] or [0])
     if records:
@@ -924,7 +1032,8 @@ def doctor():
     if all_live and any(s["tty"] for s in all_live) and not live:
         say("WARN", "Claude is running in a terminal but no session file says kind interactive (kinds seen: %s), so Claude's own file cannot pick the conversation" % ", ".join(sorted({str(s["kind"]) for s in all_live})))
     if all_live and not transcripts_findable():
-        say("WARN", "Claude is running but no conversation files can be found under ~/.claude/projects (Claude may have moved them), so the check that stops a wrong id being typed is off")
+        say("WARN", "Claude is running but no conversation files can be found under %s (Claude may have moved them), so the check that stops a wrong id being typed is off"
+            % " or ".join(a["projects"] for a in known))
     try:
         with open(HOOK_ERRORS) as f:
             errors = f.read().strip().splitlines()
@@ -934,7 +1043,7 @@ def doctor():
     if recent_errors:
         say("WARN", "the hook logged %d errors in the last 7 days, last: %s" % (len(recent_errors), recent_errors[-1][:150]))
 
-    sessions = sorted(glob.glob(os.path.join(SESSIONS, "*.json")), key=mtime, reverse=True)[:5]
+    sessions = sorted((p for a in known for p in glob.glob(os.path.join(a["sessions"], "*.json"))), key=mtime, reverse=True)[:5]
     if not sessions:
         say("INFO", "no Claude session files found, so only the hook can say which conversation is in which tab")
     else:
@@ -955,10 +1064,12 @@ def doctor():
     unnamed = []
     for line in ps_output(["-axo", "pid=,tty=,comm="]).splitlines():
         parts = line.split(None, 2)  # only Claudes attached to a terminal: helper processes have none
-        if len(parts) == 3 and parts[1] != "??" and os.path.basename(parts[2].strip()) == "claude" and not os.path.exists(os.path.join(SESSIONS, parts[0] + ".json")):
+        if (len(parts) == 3 and parts[1] != "??" and os.path.basename(parts[2].strip()) == "claude"
+                and not any(os.path.exists(os.path.join(a["sessions"], parts[0] + ".json")) for a in known)):
             unnamed.append(parts[0])
     if unnamed:
-        say("WARN", "Claude is running (process %s) but ~/.claude/sessions/%s.json does not exist, so Claude Code may have renamed its session files. The fallback is off, the hook still works" % (unnamed[0], unnamed[0]))
+        say("WARN", "Claude is running (process %s) but %s.json does not exist in %s, so Claude Code may have renamed its session files, or that Claude runs on a config folder the accounts file does not list. The fallback is off, the hook still works"
+            % (unnamed[0], unnamed[0], " or ".join(a["sessions"] for a in known)))
     own_start = ps_output(["-o", "lstart=", "-p", str(os.getpid())])
     if parse_ps_time(own_start) is None:
         say("WARN", "ps prints process start times in a format this script cannot read: %r" % own_start.strip()[:40])

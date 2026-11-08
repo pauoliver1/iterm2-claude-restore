@@ -130,6 +130,22 @@ Tell the user what you changed (files created, the `settings.json` difference an
 - **Cleanup.** The saved layout is rewritten only when something real changes, and is about 6 KB. A layout that gets smaller, such as a closed tab, is saved only after it stays smaller for one more round, and the old one is backed up first. It keeps at most 20 older copies: up to 10 safety copies and up to 10 periodic ones. `restore.log` is trimmed to its last 500 lines past 200 KB. Hook records older than 30 days for tabs that no longer exist are deleted. `hook-errors.log` is trimmed to its last 50 lines past 20 KB.
 - **It says so when something breaks.** If an update to Claude Code, Codex or iTerm2 changes what it depends on, the script writes a WARNING to `restore.log` and shows a notification instead of failing silently.
 
+## Several Claude accounts
+
+Skip this unless you run more than one Claude account, each with its own config folder through `CLAUDE_CONFIG_DIR` (for example a `claude-work` command that sets `CLAUDE_CONFIG_DIR=~/.claude-work` and then runs `claude`). Without it, every tab resumes with plain `claude --resume` as described above.
+
+List each extra folder and the command that starts Claude on it in `~/.claude/iterm-restore/accounts.json`. Your default `~/.claude` with `claude` is always included and needs no entry:
+
+```json
+{"accounts": [{"config_dir": "~/.claude-work", "command": "claude-work"}]}
+```
+
+- The hook records which config folder each tab's Claude ran on, and the script reads that account's session and conversation files. Each tab then resumes with its own command, for example `cd <folder> && claude-work --resume <id>`.
+- `command` must be a plain program name on your `PATH`: letters, digits, dots, dashes and underscores, no spaces or slashes. It is typed into your terminal, so anything else is ignored.
+- A tab whose Claude ran on a folder the file does not list gets only `cd <folder>`, never a guessed command.
+- `--doctor` lists the extra accounts and warns about an entry it cannot use or a command it cannot find. The file is listed in `.gitignore`.
+- Tabs opened before you add the file still resume on the right account while their Claude is running, because Claude's own session file in that folder says which one it is.
+
 ## Reading the doctor
 
 `python3 ~/.claude/iterm-restore/restore.py --doctor` prints OK, INFO or WARN for each thing the tool depends on.
@@ -177,6 +193,7 @@ Not verified:
 - `hook.py`: the Claude Code `SessionStart` hook.
 - `tests/check.py`: the automated checks. They touch only temporary folders.
 - Created at runtime in `~/.claude/iterm-restore/`: `layout.json`, `hooks/`, `backups/`, `restore.log` and `hook-errors.log`.
+- Optional, written by you: `accounts.json`, only if you run several Claude accounts (see above).
 
 ## License
 

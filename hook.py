@@ -79,6 +79,9 @@ def main():
         "source": data.get("source"),
         "saved_at": time.time(),
     }
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")  # set when this Claude runs on another account's config folder
+    if config_dir:
+        record["config_dir"] = os.path.realpath(os.path.expanduser(config_dir))
     tmp = os.path.join(DIR, "%s.%d.tmp" % (tab_id, os.getpid()))  # per process, so two hooks in one tab never share a temp file
     with open(tmp, "w") as f:
         json.dump(record, f)
